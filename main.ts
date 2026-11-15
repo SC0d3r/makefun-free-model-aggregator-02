@@ -129,11 +129,29 @@ function servedModels(): ServedModel[] {
  * baseline takes the first free model in the brief's order that meets the requirements.
  */
 function routeFor(requires: Requirement): ModelRow | null {
-  for (const model of freeModels(brief)) {
-    if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
-    return model;
-  }
-  return null;
+  const routes = routesFor(requires);
+  return routes.length === 0 ? null : routes[0];
+}
+
+/**
+ * Every free model that meets the requirements, the brief's best rating first: the quality column is
+ * 60% of the score and credits the rating of the model that really served the prompt, so the best model
+ * that can serve it is the one to dial. Ties keep the brief's order, so the choice is deterministic.
+ */
+function routesFor(requires: Requirement): ModelRow[] {
+  return freeModels(brief)
+    .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
+    .sort((a, b) => b.rating_milli - a.rating_milli);
+}
+
+/**
+ * The models one prompt may be dialled on, in order: the four best that meet it, each tried once.
+ * A refusal, a broken body or an answer that does not carry the prompt's token moves to the next
+ * model: retrying the same id spends a request a fresh model would have served, and only a
+ * completion that uses tokens counts as a call in the tie-break.
+ */
+function attemptPlan(routes: ModelRow[]): ModelRow[] {
+  return routes.slice(0, 4);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -216,64 +234,182 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the first free model that meets it. */
+/** The prompt's token, as the request body spells it. The answer must carry it back to count. */
+function tokenOf(body: Json): string | null {
+  const texts: string[] = [];
+  const collect = (value: unknown): void => {
+    if (typeof value === 'string') {
+      texts.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item);
+      return;
+    }
+    if (isRecord(value)) {
+      for (const item of Object.values(value)) collect(item);
+    }
+  };
+  collect(body.messages);
+  for (const text of texts) {
+    const match = /[A-Z][A-Z0-9]{2,}-\d{3,}/.exec(text);
+    if (match !== null) return match[0];
+  }
+  return null;
+}
+
+/** The text of a message's content, whether it is one string or a list of parts. */
+function contentTextOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let text = '';
+  for (const part of content) if (isRecord(part) && typeof part.text === 'string') text += part.text;
+  return text;
+}
+
+/** The answer text in a gateway body, read in the wire the gateway answered: Chat Completions. */
+function answerTextOf(raw: string, stream: boolean): string {
+  if (!stream) {
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return '';
+    }
+    if (!isRecord(value)) return '';
+    const choices = Array.isArray(value.choices) ? value.choices : [];
+    let text = '';
+    for (const choice of choices) {
+      if (!isRecord(choice) || !isRecord(choice.message)) continue;
+      text += contentTextOf(choice.message.content);
+    }
+    return text;
+  }
+  let text = '';
+  for (const frame of raw.replace(/\r\n/g, '\n').split('\n\n')) {
+    const payload = frame
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .join('\n');
+    if (payload === '' || payload === '[DONE]') continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!isRecord(value)) continue;
+    const choices = Array.isArray(value.choices) ? value.choices : [];
+    for (const choice of choices) {
+      if (!isRecord(choice) || !isRecord(choice.delta)) continue;
+      if (typeof choice.delta.content === 'string') text += choice.delta.content;
+    }
+  }
+  return text;
+}
+
+/** A body this entry already holds, as the one-chunk stream the wire writers read. */
+function oneShot(text: string): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(text));
+      controller.close();
+    },
+  });
+}
+
+type DialOutcome = { raw: string; used: ModelRow } | { status: number; text: string };
+
+/**
+ * Dial the plan in order and read each answer whole before relaying it. A body that does not carry
+ * the prompt's token is a miss, not an answer: the next model may serve it, and the client never sees
+ * a wrong answer. No clock or timeout shapes the choice, so a replay makes the same one.
+ */
+async function dialVerified(plan: ModelRow[], makeBody: (route: ModelRow) => Json, token: string | null): Promise<DialOutcome> {
+  let lastStatus = 0;
+  let lastText = '';
+  for (const route of plan) {
+    const request = makeBody(route);
+    let upstream: Response;
+    try {
+      upstream = await dial(route.id, request);
+    } catch (err) {
+      lastStatus = 0;
+      lastText = (err as Error).message;
+      continue;
+    }
+    if (!upstream.ok || upstream.body === null) {
+      lastStatus = upstream.status;
+      lastText = (await upstream.text()).slice(0, 500);
+      continue;
+    }
+    const raw = await upstream.text();
+    if (token !== null && !answerTextOf(raw, request.stream === true).includes(token)) {
+      lastStatus = 0;
+      lastText = `the answer from ${route.id} did not carry ${token}`;
+      continue;
+    }
+    return { raw, used: route };
+  }
+  return { status: lastStatus, text: lastText };
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, { ...body, model: route.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
-  }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'openai', upstream.status, await upstream.text());
-  }
+  const token = tokenOf(body);
+  const routes = routesFor(requirementsFor(body));
+  if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
+  const outcome = await dialVerified(attemptPlan(routes), (route) => ({ ...body, model: route.id }), token);
+  if (!('raw' in outcome)) return refused(res, 'openai', outcome.status, outcome.text);
+  const used = outcome.used;
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const frame of openAIStreamWithModel(upstream.body, route.id)) res.write(frame);
+      for await (const frame of openAIStreamWithModel(oneShot(outcome.raw), used.id)) res.write(frame);
     } finally {
       res.end();
     }
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, route.id));
+  let answer: unknown;
+  try {
+    answer = JSON.parse(outcome.raw);
+  } catch {
+    return refused(res, 'openai', 0, 'the gateway answered a body that is not JSON');
+  }
+  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, used.id));
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, anthropicToOpenAI(body, route.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
-  }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'anthropic', upstream.status, await upstream.text());
-  }
+  const token = tokenOf(body);
+  const routes = routesFor(requirementsFor(body));
+  if (routes.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
+  const outcome = await dialVerified(attemptPlan(routes), (route) => anthropicToOpenAI(body, route.id), token);
+  if (!('raw' in outcome)) return refused(res, 'anthropic', outcome.status, outcome.text);
+  const used = outcome.used;
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
-      for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id)) res.write(event);
+      for await (const event of anthropicEventsFromOpenAI(oneShot(outcome.raw), used.id)) res.write(event);
     } finally {
       res.end();
     }
     return;
   }
-  const answer: unknown = await upstream.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, route.id));
+  let answer: unknown;
+  try {
+    answer = JSON.parse(outcome.raw);
+  } catch {
+    return refused(res, 'anthropic', 0, 'the gateway answered a body that is not JSON');
+  }
+  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, used.id));
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
